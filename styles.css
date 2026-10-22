@@ -162,6 +162,8 @@ button:disabled {
 }
 
 canvas#world,
+canvas#gpu-world,
+canvas#gpu-effects,
 canvas#effects {
   display: block;
   width: 100%;
@@ -176,6 +178,8 @@ canvas#world.harvesting { cursor: grab; }
 canvas#world.harvesting:active { cursor: grabbing; }
 canvas#world.animal-interaction { cursor: pointer; }
 canvas#world.animal-interaction:active { cursor: grabbing; }
+canvas#gpu-world,
+canvas#gpu-effects,
 canvas#effects { position: absolute; inset: 0; pointer-events: none; image-rendering: auto; }
 
 .status {

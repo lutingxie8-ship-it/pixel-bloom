@@ -5,6 +5,8 @@ const canvas = document.querySelector('#world');
 const ctx = canvas.getContext('2d');
 const effectsCanvas = document.querySelector('#effects');
 const effectsCtx = effectsCanvas.getContext('2d');
+const gpuWorldCanvas = document.querySelector('#gpu-world');
+const gpuEffectsCanvas = document.querySelector('#gpu-effects');
 const palette = document.querySelector('#palette');
 const brushInput = document.querySelector('#brush');
 const speedSelect = document.querySelector('#speed');
@@ -26,6 +28,10 @@ const drainagePopupText = document.querySelector('#drainage-popup-text');
 
 const WIDTH = canvas.width;
 const HEIGHT = canvas.height;
+const gpuWorldRenderer = globalThis.PixelBloomWebGL?.createWorld(gpuWorldCanvas) || null;
+const gpuEffectsRenderer = globalThis.PixelBloomWebGL?.create(gpuEffectsCanvas) || null;
+const GPU_EFFECT_STRIDE = globalThis.PixelBloomWebGL?.STRIDE || 8;
+const gpuEffectData = new Float32Array(WIDTH * HEIGHT * GPU_EFFECT_STRIDE);
 const WORLD_SCALE = 2;
 const SCENE_WIDTH = Math.floor(WIDTH / WORLD_SCALE);
 const SCENE_HEIGHT = Math.floor(HEIGHT / WORLD_SCALE);
@@ -1876,9 +1882,13 @@ function render(now = globalThis.performance?.now?.() ?? 0) {
           pixels[at + 3] = 255;
         }
       }
-      if (!redrawAll) ctx.putImageData(image, 0, 0, minX, minY, maxX - minX, maxY - minY);
+      if (!gpuWorldRenderer && !redrawAll) {
+        ctx.putImageData(image, 0, 0, minX, minY, maxX - minX, maxY - minY);
+      }
     }
-    if (redrawAll) {
+    if (gpuWorldRenderer) {
+      gpuWorldRenderer.render(pixels);
+    } else if (redrawAll) {
       ctx.putImageData(image, 0, 0);
     }
     dirtyRenderChunks.fill(0);
@@ -2063,6 +2073,22 @@ function drawTreeFruit(x, y, i, kind, scaleX, scaleY) {
 }
 
 const STEM_NEIGHBORS = [[0, 1], [-1, 1], [1, 1], [-1, 0], [1, 0]];
+let gpuEffectCount = 0;
+
+function addGpuEffect(x, y, color, alpha, size, shape, wilt = 0) {
+  if (!gpuEffectsRenderer) return;
+  const at = gpuEffectCount * GPU_EFFECT_STRIDE;
+  const dry = [133, 105, 64];
+  gpuEffectData[at] = x;
+  gpuEffectData[at + 1] = y;
+  gpuEffectData[at + 2] = (color[0] * (1 - wilt) + dry[0] * wilt) / 255;
+  gpuEffectData[at + 3] = (color[1] * (1 - wilt) + dry[1] * wilt) / 255;
+  gpuEffectData[at + 4] = (color[2] * (1 - wilt) + dry[2] * wilt) / 255;
+  gpuEffectData[at + 5] = alpha;
+  gpuEffectData[at + 6] = size;
+  gpuEffectData[at + 7] = shape;
+  gpuEffectCount++;
+}
 
 function renderEffects() {
   const scaleX = effectsCanvas.width / WIDTH;
@@ -2074,6 +2100,7 @@ function renderEffects() {
   effectsCtx.globalCompositeOperation = 'lighter';
   effectsCtx.filter = 'none';
   let currentFilter = 'none';
+  gpuEffectCount = 0;
 
   for (let i = 0; i < cells.length; i++) {
     const kind = cells[i];
@@ -2090,8 +2117,17 @@ function renderEffects() {
     const x = (i % WIDTH + 0.5) * scaleX;
     const y = (Math.floor(i / WIDTH) + 0.5) * scaleY;
     const pulse = 0.72 + ((i + tick) % 7) * 0.035;
-    if (kind === FRUIT || kind === FALLEN_FRUIT) {
+    if (gpuEffectsRenderer && (kind === FRUIT || kind === FALLEN_FRUIT)) {
+      const ripe = Math.min(1, (kind === FALLEN_FRUIT ? plantAge[i] : energy[i]) / FRUIT_RIPEN_TICKS);
+      const size = (1.55 + plantBranchId[i] % 4 * 0.1) * (0.55 + 0.45 * ripe);
+      addGpuEffect(x, y, fruitColorFor(i, kind), kind === FALLEN_FRUIT ? Math.min(1, energy[i] / 45) : 1,
+        size * 2.35 * scaleX, 0, wilt);
+      continue;
+    } else if (kind === FRUIT || kind === FALLEN_FRUIT) {
       drawTreeFruit(x, y, i, kind, scaleX, scaleY);
+    } else if (gpuEffectsRenderer && kind === FIRE) {
+      addGpuEffect(x, y, [255, 105, 24], 0.72 * pulse, 7 * effectUnitX, 1);
+      continue;
     } else if (kind === FIRE) {
       effectsCtx.fillStyle = `rgba(255, 105, 24, ${0.18 * pulse})`;
       effectsCtx.shadowColor = 'rgba(255, 119, 24, 0.9)';
@@ -2099,6 +2135,9 @@ function renderEffects() {
       effectsCtx.beginPath();
       effectsCtx.arc(x, y, 1.5 * effectUnitX, 0, Math.PI * 2);
       effectsCtx.fill();
+    } else if (gpuEffectsRenderer && kind === ELECTRICITY) {
+      addGpuEffect(x, y, [255, 226, 74], 0.8 * pulse, 9 * effectUnitX, 1);
+      continue;
     } else if (kind === ELECTRICITY) {
       effectsCtx.fillStyle = `rgba(255, 226, 74, ${0.2 * pulse})`;
       effectsCtx.shadowColor = 'rgba(255, 225, 76, 0.95)';
@@ -2130,6 +2169,12 @@ function renderEffects() {
         1 - (family.rootY - gridY) / Math.max(1, family.treeTrunkHeight) * 0.35) : 1;
       const woodyWidth = woody
         ? 2.1 * (family.treeGirth ?? 1) * (trunk ? trunkTaper : 0.5) : 0;
+      if (gpuEffectsRenderer && !giant && !mushroom) {
+        const color = woody ? [132, 94, 63] : absorbing || freshBud ? [122, 226, 138] : [49, 156, 72];
+        const size = (woody ? Math.max(2.2, woodyWidth * 1.55) : 2.8) * scaleX;
+        addGpuEffect(x, y, color, woody ? 0.92 : 0.82 * pulse, size, 0, wilt);
+        continue;
+      }
       let stemX = -1;
       let stemY = -1;
       for (let neighbor = 0; neighbor < (woody ? STEM_NEIGHBORS.length : 3); neighbor++) {
@@ -2193,6 +2238,11 @@ function renderEffects() {
         drawGiantFlower(x, y, flowerSeed, unfold, scaleX, scaleY);
         continue;
       }
+      if (gpuEffectsRenderer) {
+        addGpuEffect(x, y, flowerColor, 0.45 + 0.55 * unfold,
+          Math.max(2, (4 + 5 * unfold) * flowerSize * scaleX), 2, wilt);
+        continue;
+      }
       const petalOffset = shape.offset * unfold * flowerSize;
       const petalLength = (0.3 + (shape.length - 0.3) * unfold) * flowerSize;
       const petalWidth = (0.25 + (shape.width - 0.25) * unfold) * flowerSize;
@@ -2225,6 +2275,9 @@ function renderEffects() {
         0.35 * unfold * scaleX * flowerSize, 0, Math.PI * 2);
       effectsCtx.fill();
       effectsCtx.globalCompositeOperation = 'lighter';
+    } else if (gpuEffectsRenderer) {
+      addGpuEffect(x, y, [176, 198, 201], 0.38 * pulse, 6 * effectUnitX, 1);
+      continue;
     } else {
       effectsCtx.fillStyle = `rgba(176, 198, 201, ${0.045 * pulse})`;
       effectsCtx.shadowColor = 'rgba(180, 205, 210, 0.3)';
@@ -2234,6 +2287,7 @@ function renderEffects() {
       effectsCtx.fill();
     }
   }
+  gpuEffectsRenderer?.render(gpuEffectData, gpuEffectCount);
   // 一株只画一圈吸水涟漪，位置跟随实际接触水的格子。
   if (currentFilter !== 'none') effectsCtx.filter = 'none';
   globalThis.sandboxAnimals?.draw(effectsCtx, scaleX, scaleY);

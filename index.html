@@ -81,6 +81,8 @@
     <div class="canvas-shell">
       <div class="canvas-stage">
         <canvas id="world" width="360" height="220" aria-label="可绘制沙、水、石头、花草种子、小树种子、霸王花种子、蘑菇孢子、仙人掌种子、柳树种子和红树林种子的模拟画布"></canvas>
+        <canvas id="gpu-world" width="360" height="220" aria-hidden="true"></canvas>
+        <canvas id="gpu-effects" width="720" height="440" aria-hidden="true"></canvas>
         <canvas id="effects" width="720" height="440" aria-hidden="true"></canvas>
       </div>
       <div class="status">
@@ -129,6 +131,7 @@
     </div>
   </dialog>
   <script src="aicraft-pixel-engine-adapter.js" defer></script>
+  <script src="webgl-effects.js" defer></script>
   <script src="app.js" defer></script>
   <script src="world-storage.js" defer></script>
   <script src="animals.js" defer></script>
