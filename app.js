@@ -135,12 +135,11 @@ const CHUNK_SIZE = 10;
 const CHUNK_COLUMNS = Math.ceil(WIDTH / CHUNK_SIZE);
 const CHUNK_ROWS = Math.ceil(HEIGHT / CHUNK_SIZE);
 const activeChunks = new Uint8Array(CHUNK_COLUMNS * CHUNK_ROWS);
+const currentChunks = new Uint8Array(CHUNK_COLUMNS * CHUNK_ROWS);
 const nextActiveChunks = new Uint8Array(CHUNK_COLUMNS * CHUNK_ROWS);
 
-let dirtyMinX = 0;
-let dirtyMinY = 0;
-let dirtyMaxX = WIDTH - 1;
-let dirtyMaxY = HEIGHT - 1;
+const dirtyRenderChunks = new Uint8Array(CHUNK_COLUMNS * CHUNK_ROWS);
+dirtyRenderChunks.fill(1);
 
 let selected = SAND;
 let running = true;
@@ -211,17 +210,11 @@ function wakeCell(i) {
 function markDirty(i) {
   const x = i % WIDTH;
   const y = Math.floor(i / WIDTH);
-  dirtyMinX = Math.min(dirtyMinX, x);
-  dirtyMinY = Math.min(dirtyMinY, y);
-  dirtyMaxX = Math.max(dirtyMaxX, x);
-  dirtyMaxY = Math.max(dirtyMaxY, y);
+  dirtyRenderChunks[chunkIndex(x, y)] = 1;
 }
 
 function markAllDirty() {
-  dirtyMinX = 0;
-  dirtyMinY = 0;
-  dirtyMaxX = WIDTH - 1;
-  dirtyMaxY = HEIGHT - 1;
+  dirtyRenderChunks.fill(1);
 }
 
 function setCell(i, kind, nextEnergy = initialEnergy(kind), nextAge = 0, nextLean = 0, nextBranchBudget = 0, nextBranchId = 0) {
@@ -1727,8 +1720,8 @@ function updatePlantWaterlogging() {
       }
     }
     changing ||= previousWilt !== (family.wilt || 0);
-    // 根部持续活动，使成熟植物也会响应后来倒入的水。
-    wakeCell(root);
+    // 积水变化时保持根部活跃；稳定、干燥的成熟植物不再每帧强制唤醒周围九个分块。
+    if (flooded || family.waterlogStress > 0 || tick % 30 === 0) wakeCell(root);
   }
   if (newWarning && !drainagePopup.open) drainagePopup.show();
   if (drainagePopup.open) {
@@ -1740,7 +1733,7 @@ function updatePlantWaterlogging() {
   }
   if (changing && tick % 8 === 0) markAllDirty();
   // 完全枯死后逐格凋落；仍使用原植物材料，保留火烧和酸蚀反应。
-  if (tick % 8 !== 0) return;
+  if (tick % 8 !== 0 || deadCount === 0) return;
   for (let i = 0; i < cells.length; i++) {
     if (![PLANT, FLOWER, LEAF, FRUIT].includes(cells[i])) continue;
     const family = familyForBranch(plantBranchId[i]);
@@ -1756,41 +1749,53 @@ function updatePlantWaterlogging() {
 
 function update() {
   moved.fill(0);
-  const currentChunks = activeChunks.slice();
+  currentChunks.set(activeChunks);
   nextActiveChunks.fill(0);
   updatePlantWaterlogging();
   // 重力材料从下往上扫描，避免同一个粒子在一帧内连续下落多格。
   for (let y = HEIGHT - 2; y >= 0; y--) {
     const reverse = (y + tick) % 2 === 0;
-    for (let step = 0; step < WIDTH; step++) {
-      const x = reverse ? WIDTH - 1 - step : step;
-      const i = indexOf(x, y);
-      if (!currentChunks[chunkIndex(x, y)]) continue;
-      if (moved[i]) continue;
-      if (cells[i] === SAND || cells[i] === WATER) updatePowderOrLiquid(x, y, cells[i]);
-      else if (cells[i] === SALT) updateSalt(x, y, i);
-      else if (isSeedKind(cells[i])) updateSeed(x, y, i);
-      else if (cells[i] === ACID) updateAcid(x, y, i);
-      else if (cells[i] === WOOD) updateWood(x, y, i);
-      else if (cells[i] === PLANT) updatePlant(x, y, i);
-      else if (cells[i] === FLOWER) updateFlower(x, y, i);
-      else if (cells[i] === FRUIT) updateFruit(x, y, i);
-      else if (cells[i] === FALLEN_FRUIT) updateFallenFruit(x, y, i);
-      else if (cells[i] === METAL) updateMetal(x, y, i);
-      else if (cells[i] === ELECTRICITY) updateElectricity(x, y, i);
+    const chunkRow = Math.floor(y / CHUNK_SIZE) * CHUNK_COLUMNS;
+    for (let chunkStep = 0; chunkStep < CHUNK_COLUMNS; chunkStep++) {
+      const chunkX = reverse ? CHUNK_COLUMNS - 1 - chunkStep : chunkStep;
+      if (!currentChunks[chunkRow + chunkX]) continue;
+      const minX = chunkX * CHUNK_SIZE;
+      const maxX = Math.min(WIDTH, minX + CHUNK_SIZE);
+      for (let localStep = 0; localStep < maxX - minX; localStep++) {
+        const x = reverse ? maxX - 1 - localStep : minX + localStep;
+        const i = indexOf(x, y);
+        if (moved[i]) continue;
+        if (cells[i] === SAND || cells[i] === WATER) updatePowderOrLiquid(x, y, cells[i]);
+        else if (cells[i] === SALT) updateSalt(x, y, i);
+        else if (isSeedKind(cells[i])) updateSeed(x, y, i);
+        else if (cells[i] === ACID) updateAcid(x, y, i);
+        else if (cells[i] === WOOD) updateWood(x, y, i);
+        else if (cells[i] === PLANT) updatePlant(x, y, i);
+        else if (cells[i] === FLOWER) updateFlower(x, y, i);
+        else if (cells[i] === FRUIT) updateFruit(x, y, i);
+        else if (cells[i] === FALLEN_FRUIT) updateFallenFruit(x, y, i);
+        else if (cells[i] === METAL) updateMetal(x, y, i);
+        else if (cells[i] === ELECTRICITY) updateElectricity(x, y, i);
+      }
     }
   }
   // 上升材料采用相反扫描方向。
   for (let y = 1; y < HEIGHT; y++) {
     const reverse = (y + tick) % 2 !== 0;
-    for (let step = 0; step < WIDTH; step++) {
-      const x = reverse ? WIDTH - 1 - step : step;
-      const i = indexOf(x, y);
-      if (!currentChunks[chunkIndex(x, y)]) continue;
-      if (moved[i]) continue;
-      if (cells[i] === FIRE) updateFire(x, y, i);
-      else if (cells[i] === SMOKE) updateSmoke(x, y, i);
-      else if (cells[i] === STEAM) updateSteam(x, y, i);
+    const chunkRow = Math.floor(y / CHUNK_SIZE) * CHUNK_COLUMNS;
+    for (let chunkStep = 0; chunkStep < CHUNK_COLUMNS; chunkStep++) {
+      const chunkX = reverse ? CHUNK_COLUMNS - 1 - chunkStep : chunkStep;
+      if (!currentChunks[chunkRow + chunkX]) continue;
+      const minX = chunkX * CHUNK_SIZE;
+      const maxX = Math.min(WIDTH, minX + CHUNK_SIZE);
+      for (let localStep = 0; localStep < maxX - minX; localStep++) {
+        const x = reverse ? maxX - 1 - localStep : minX + localStep;
+        const i = indexOf(x, y);
+        if (moved[i]) continue;
+        if (cells[i] === FIRE) updateFire(x, y, i);
+        else if (cells[i] === SMOKE) updateSmoke(x, y, i);
+        else if (cells[i] === STEAM) updateSteam(x, y, i);
+      }
     }
   }
   globalThis.sandboxAnimals?.update();
@@ -1837,45 +1842,66 @@ function healthyColorFor(i, kind) {
   return MATERIALS[kind].color;
 }
 
-function render() {
-  const pixels = image.data;
-  const counts = new Uint32Array(MATERIALS.length);
-  for (let i = 0; i < cells.length; i++) counts[cells[i]]++;
+let lastStatsRenderTime = -Infinity;
+let lastEffectsTick = -1;
+let lastEffectsRenderTime = -Infinity;
 
-  const hasDirtyRegion = dirtyMinX <= dirtyMaxX && dirtyMinY <= dirtyMaxY;
+function render(now = globalThis.performance?.now?.() ?? 0) {
+  const pixels = image.data;
+  let dirtyChunkCount = 0;
+  for (const dirty of dirtyRenderChunks) dirtyChunkCount += dirty;
+  const hasDirtyRegion = dirtyChunkCount > 0;
   if (hasDirtyRegion) {
-    for (let y = dirtyMinY; y <= dirtyMaxY; y++) {
-      for (let x = dirtyMinX; x <= dirtyMaxX; x++) {
-        const i = indexOf(x, y);
-        const kind = cells[i];
-        const color = colorFor(i, kind);
-        const at = i * 4;
-        const shade = kind === EMPTY ? 0 : ((i * 17) % 9) - 4;
-        pixels[at] = color[0] + shade;
-        pixels[at + 1] = color[1] + shade;
-        pixels[at + 2] = color[2] + shade;
-        pixels[at + 3] = 255;
+    // 少量变化按 10×10 分块上传；变化遍布大半画布时一次性整图上传，
+    // 避免大量 putImageData 调用反而拖慢浏览器。
+    const redrawAll = dirtyChunkCount > dirtyRenderChunks.length * 0.35;
+    for (let chunk = 0; chunk < dirtyRenderChunks.length; chunk++) {
+      if (!redrawAll && !dirtyRenderChunks[chunk]) continue;
+      const chunkX = chunk % CHUNK_COLUMNS;
+      const chunkY = Math.floor(chunk / CHUNK_COLUMNS);
+      const minX = chunkX * CHUNK_SIZE;
+      const minY = chunkY * CHUNK_SIZE;
+      const maxX = Math.min(WIDTH, minX + CHUNK_SIZE);
+      const maxY = Math.min(HEIGHT, minY + CHUNK_SIZE);
+      for (let y = minY; y < maxY; y++) {
+        for (let x = minX; x < maxX; x++) {
+          const i = indexOf(x, y);
+          const kind = cells[i];
+          const color = colorFor(i, kind);
+          const at = i * 4;
+          const shade = kind === EMPTY ? 0 : ((i * 17) % 9) - 4;
+          pixels[at] = color[0] + shade;
+          pixels[at + 1] = color[1] + shade;
+          pixels[at + 2] = color[2] + shade;
+          pixels[at + 3] = 255;
+        }
       }
+      if (!redrawAll) ctx.putImageData(image, 0, 0, minX, minY, maxX - minX, maxY - minY);
     }
-    ctx.putImageData(
-      image,
-      0,
-      0,
-      dirtyMinX,
-      dirtyMinY,
-      dirtyMaxX - dirtyMinX + 1,
-      dirtyMaxY - dirtyMinY + 1,
-    );
-    dirtyMinX = WIDTH;
-    dirtyMinY = HEIGHT;
-    dirtyMaxX = -1;
-    dirtyMaxY = -1;
+    if (redrawAll) {
+      ctx.putImageData(image, 0, 0);
+    }
+    dirtyRenderChunks.fill(0);
   }
-  const seedCount = MATERIALS.reduce((total, material) => total + (isSeedKind(material.id) ? counts[material.id] : 0), 0);
-  statsLabel.textContent = `水：${counts[WATER]} · 种子：${seedCount} · 根茎：${counts[PLANT]} · 树叶：${counts[LEAF]} · 果实：${counts[FRUIT] + counts[FALLEN_FRUIT]} · 花/菌盖：${counts[FLOWER]} · 火：${counts[FIRE]} · 酸：${counts[ACID]} · 盐：${counts[SALT]} · 电：${counts[ELECTRICITY]} · 第 ${tick} 帧`;
-  harvestStatsLabel.textContent = `🧺 已收集：${harvestTotals.picked + harvestTotals.fallen} · 树上采摘：${harvestTotals.picked} · 落果拾取：${harvestTotals.fallen}`;
-  globalThis.sandboxAnimals?.renderStatus();
-  renderEffects();
+  // 状态栏不需要跟随 60 FPS 重算。降低全世界扫描和 DOM 更新频率，
+  // 但首次渲染、暂停后的手动修改仍会立即更新。
+  if (now - lastStatsRenderTime >= 400) {
+    const counts = new Uint32Array(MATERIALS.length);
+    for (let i = 0; i < cells.length; i++) counts[cells[i]]++;
+    const seedCount = MATERIALS.reduce((total, material) => total + (isSeedKind(material.id) ? counts[material.id] : 0), 0);
+    statsLabel.textContent = `水：${counts[WATER]} · 种子：${seedCount} · 根茎：${counts[PLANT]} · 树叶：${counts[LEAF]} · 果实：${counts[FRUIT] + counts[FALLEN_FRUIT]} · 花/菌盖：${counts[FLOWER]} · 火：${counts[FIRE]} · 酸：${counts[ACID]} · 盐：${counts[SALT]} · 电：${counts[ELECTRICITY]} · 第 ${tick} 帧`;
+    harvestStatsLabel.textContent = `🧺 已收集：${harvestTotals.picked + harvestTotals.fallen} · 树上采摘：${harvestTotals.picked} · 落果拾取：${harvestTotals.fallen}`;
+    globalThis.sandboxAnimals?.renderStatus();
+    lastStatsRenderTime = now;
+  }
+  // 暂停且世界未变化时复用上一帧特效层，避免空转扫描全部格子。
+  const effectsChanged = hasDirtyRegion || tick !== lastEffectsTick;
+  const effectsDue = !running || now - lastEffectsRenderTime >= 32;
+  if (lastEffectsTick < 0 || (effectsChanged && effectsDue)) {
+    renderEffects();
+    lastEffectsTick = tick;
+    lastEffectsRenderTime = now;
+  }
   refreshHarvestCursor();
 }
 
@@ -2509,12 +2535,14 @@ function loop(now) {
   let steps = 0;
   if (running) {
     const stepDuration = 16.67 / simulationSpeed;
-    while (accumulatedTime >= stepDuration && steps < 10) {
+    // 帧率下降时只补有限步数，避免一帧连续补算十次造成更严重的停顿。
+    const maxCatchUpSteps = Math.max(3, simulationSpeed);
+    while (accumulatedTime >= stepDuration && steps < maxCatchUpSteps) {
       update();
       accumulatedTime -= stepDuration;
       steps++;
     }
-    if (steps === 10) accumulatedTime = 0;
+    if (steps === maxCatchUpSteps) accumulatedTime = 0;
   } else {
     accumulatedTime = 0;
   }
@@ -2528,7 +2556,7 @@ function loop(now) {
     metricsWindowStart = now;
     metricsFrameCount = 0;
   }
-  render();
+  render(now);
   requestAnimationFrame(loop);
 }
 
