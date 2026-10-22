@@ -2036,6 +2036,8 @@ function drawTreeFruit(x, y, i, kind, scaleX, scaleY) {
   effectsCtx.restore();
 }
 
+const STEM_NEIGHBORS = [[0, 1], [-1, 1], [1, 1], [-1, 0], [1, 0]];
+
 function renderEffects() {
   const scaleX = effectsCanvas.width / WIDTH;
   const scaleY = effectsCanvas.height / HEIGHT;
@@ -2044,6 +2046,8 @@ function renderEffects() {
   effectsCtx.clearRect(0, 0, effectsCanvas.width, effectsCanvas.height);
   effectsCtx.save();
   effectsCtx.globalCompositeOperation = 'lighter';
+  effectsCtx.filter = 'none';
+  let currentFilter = 'none';
 
   for (let i = 0; i < cells.length; i++) {
     const kind = cells[i];
@@ -2051,8 +2055,12 @@ function renderEffects() {
         kind !== PLANT && kind !== FRUIT && kind !== FALLEN_FRUIT) continue;
     const wilt = [PLANT, FLOWER, FRUIT].includes(kind)
       ? familyForBranch(plantBranchId[i])?.wilt || 0 : 0;
-    effectsCtx.filter = wilt > 0
+    const nextFilter = wilt > 0
       ? `sepia(${wilt}) saturate(${1 - wilt * 0.8}) brightness(${1 - wilt * 0.3})` : 'none';
+    if (nextFilter !== currentFilter) {
+      effectsCtx.filter = nextFilter;
+      currentFilter = nextFilter;
+    }
     const x = (i % WIDTH + 0.5) * scaleX;
     const y = (Math.floor(i / WIDTH) + 0.5) * scaleY;
     const pulse = 0.72 + ((i + tick) % 7) * 0.035;
@@ -2096,16 +2104,19 @@ function renderEffects() {
         1 - (family.rootY - gridY) / Math.max(1, family.treeTrunkHeight) * 0.35) : 1;
       const woodyWidth = woody
         ? 2.1 * (family.treeGirth ?? 1) * (trunk ? trunkTaper : 0.5) : 0;
-      const stemNeighbors = [
-        [gridX, gridY + 1],
-        [gridX - 1, gridY + 1],
-        [gridX + 1, gridY + 1],
-        ...(woody ? [[gridX - 1, gridY], [gridX + 1, gridY]] : []),
-      ];
-      const stemTarget = stemNeighbors.find(([nx, ny]) =>
-        inBounds(nx, ny) && cells[indexOf(nx, ny)] === PLANT,
-      );
-      if (stemTarget) {
+      let stemX = -1;
+      let stemY = -1;
+      for (let neighbor = 0; neighbor < (woody ? STEM_NEIGHBORS.length : 3); neighbor++) {
+        const [dx, dy] = STEM_NEIGHBORS[neighbor];
+        const nx = gridX + dx;
+        const ny = gridY + dy;
+        if (inBounds(nx, ny) && cells[indexOf(nx, ny)] === PLANT) {
+          stemX = nx;
+          stemY = ny;
+          break;
+        }
+      }
+      if (stemX >= 0) {
         effectsCtx.strokeStyle = mushroom ? '#e0d2b7' : woody ? 'rgba(132, 94, 63, 0.95)' : absorbing || freshBud
           ? `rgba(122, 226, 138, ${0.9 * pulse})`
           : `rgba(49, 156, 72, ${0.7 * pulse})`;
@@ -2113,7 +2124,7 @@ function renderEffects() {
         effectsCtx.lineCap = 'round';
         effectsCtx.beginPath();
         effectsCtx.moveTo(x, y);
-        effectsCtx.lineTo((stemTarget[0] + 0.5) * scaleX, (stemTarget[1] + 0.5) * scaleY);
+        effectsCtx.lineTo((stemX + 0.5) * scaleX, (stemY + 0.5) * scaleY);
         effectsCtx.stroke();
       }
       effectsCtx.fillStyle = mushroom ? '#e0d2b7' : woody ? 'rgba(132, 94, 63, 0.8)' : absorbing || freshBud
@@ -2198,7 +2209,7 @@ function renderEffects() {
     }
   }
   // 一株只画一圈吸水涟漪，位置跟随实际接触水的格子。
-  effectsCtx.filter = 'none';
+  if (currentFilter !== 'none') effectsCtx.filter = 'none';
   globalThis.sandboxAnimals?.draw(effectsCtx, scaleX, scaleY);
   effectsCtx.globalCompositeOperation = 'source-over';
   effectsCtx.shadowBlur = 0;
