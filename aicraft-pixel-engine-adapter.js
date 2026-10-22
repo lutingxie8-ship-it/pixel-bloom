@@ -47,6 +47,8 @@
     [WILLOW_SEED]: { name: 'willow-seed', type: 'powder', density: 4, dispersion: 0 },
     [MANGROVE_SEED]: { name: 'mangrove-seed', type: 'powder', density: 4, dispersion: 0 },
   });
+  const DENSITIES = new Int16Array(MANGROVE_SEED + 1);
+  for (const [id, material] of Object.entries(MATERIALS)) DENSITIES[id] = material.density;
 
   function create(options) {
     const {
@@ -58,16 +60,16 @@
     } = options;
 
     const inBounds = (x, y) => x >= 0 && x < width && y >= 0 && y < height;
-    const densityOf = (kind) => MATERIALS[kind]?.density ?? 0;
+    const densityOf = (kind) => DENSITIES[kind] ?? 0;
 
     function tryDisplace(x, y, nx, ny, kind) {
-      if (!inBounds(nx, ny)) return null;
+      if (!inBounds(nx, ny)) return false;
       const from = y * width + x;
       const to = ny * width + nx;
       const targetKind = getCell(to);
-      if (targetKind !== EMPTY && densityOf(targetKind) >= densityOf(kind)) return null;
+      if (targetKind !== EMPTY && densityOf(targetKind) >= densityOf(kind)) return false;
       swapCells(from, to);
-      return [nx, ny];
+      return true;
     }
 
     function stepPowder(x, y, kind) {
@@ -75,11 +77,20 @@
       let currentY = y;
       for (let step = 0; step < worldScale; step++) {
         const direction = Math.random() < 0.5 ? -1 : 1;
-        let destination = tryDisplace(currentX, currentY, currentX, currentY + 1, kind);
-        if (!destination) destination = tryDisplace(currentX, currentY, currentX + direction, currentY + 1, kind);
-        if (!destination) destination = tryDisplace(currentX, currentY, currentX - direction, currentY + 1, kind);
-        if (!destination) break;
-        [currentX, currentY] = destination;
+        let nextX = currentX;
+        const nextY = currentY + 1;
+        let displaced = tryDisplace(currentX, currentY, nextX, nextY, kind);
+        if (!displaced) {
+          nextX = currentX + direction;
+          displaced = tryDisplace(currentX, currentY, nextX, nextY, kind);
+        }
+        if (!displaced) {
+          nextX = currentX - direction;
+          displaced = tryDisplace(currentX, currentY, nextX, nextY, kind);
+        }
+        if (!displaced) break;
+        currentX = nextX;
+        currentY = nextY;
       }
       return currentX !== x || currentY !== y;
     }
@@ -90,29 +101,54 @@
       const dispersion = MATERIALS[kind]?.dispersion ?? 1;
       for (let step = 0; step < worldScale; step++) {
         const direction = Math.random() < 0.5 ? -1 : 1;
-        let destination = tryDisplace(currentX, currentY, currentX, currentY + 1, kind);
-        if (!destination) destination = tryDisplace(currentX, currentY, currentX + direction, currentY + 1, kind);
-        if (!destination) destination = tryDisplace(currentX, currentY, currentX - direction, currentY + 1, kind);
-        if (!destination && dispersion > 0) {
+        let nextX = currentX;
+        let nextY = currentY + 1;
+        let displaced = tryDisplace(currentX, currentY, nextX, nextY, kind);
+        if (!displaced) {
+          nextX = currentX + direction;
+          displaced = tryDisplace(currentX, currentY, nextX, nextY, kind);
+        }
+        if (!displaced) {
+          nextX = currentX - direction;
+          displaced = tryDisplace(currentX, currentY, nextX, nextY, kind);
+        }
+        if (!displaced && dispersion > 0) {
+          nextY = currentY;
           for (let distance = 1; distance <= Math.min(worldScale + 1, dispersion); distance++) {
-            destination = tryDisplace(currentX, currentY, currentX + direction * distance, currentY, kind);
-            if (destination) break;
-            destination = tryDisplace(currentX, currentY, currentX - direction * distance, currentY, kind);
-            if (destination) break;
+            nextX = currentX + direction * distance;
+            displaced = tryDisplace(currentX, currentY, nextX, nextY, kind);
+            if (displaced) break;
+            nextX = currentX - direction * distance;
+            displaced = tryDisplace(currentX, currentY, nextX, nextY, kind);
+            if (displaced) break;
           }
         }
-        if (!destination) break;
-        [currentX, currentY] = destination;
+        if (!displaced) break;
+        currentX = nextX;
+        currentY = nextY;
       }
       return currentX !== x || currentY !== y;
     }
 
     function stepParticle(x, y, kind) {
-      const material = MATERIALS[kind];
-      if (!material) return false;
-      if (material.type === 'powder') return stepPowder(x, y, kind);
-      if (material.type === 'liquid') return stepLiquid(x, y, kind);
-      return false;
+      switch (kind) {
+        case SAND:
+        case SALT:
+        case SEED:
+        case TREE_SEED:
+        case GIANT_SEED:
+        case FALLEN_FRUIT:
+        case MUSHROOM_SEED:
+        case CACTUS_SEED:
+        case WILLOW_SEED:
+        case MANGROVE_SEED:
+          return stepPowder(x, y, kind);
+        case WATER:
+        case ACID:
+          return stepLiquid(x, y, kind);
+        default:
+          return false;
+      }
     }
 
     return Object.freeze({

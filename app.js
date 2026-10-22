@@ -103,6 +103,7 @@ const GIANT_FLOWER_SCALE = 1.5;
 const MAX_TREE_GIRTH = 3.8;
 const WATERLOG_STRESS_TICKS = 300; // 持续积水约 5 秒后开始黄化（1×）。
 const WATERLOG_WILT_TICKS = 240;
+const WATERLOG_CHECK_INTERVAL = 4;
 const TREE_TRUNK_STEP_TICKS = 3;
 const TREE_BRANCH_STEP_TICKS = 5;
 const MAX_TREE_SIDE_BRANCHES = 4;
@@ -128,6 +129,10 @@ const plantAge = new Uint16Array(WIDTH * HEIGHT);
 const plantLean = new Int8Array(WIDTH * HEIGHT);
 const plantBranchBudget = new Uint8Array(WIDTH * HEIGHT);
 const plantBranchId = new Uint32Array(WIDTH * HEIGHT);
+const materialCounts = new Uint32Array(MATERIALS.length);
+materialCounts[EMPTY] = WIDTH * HEIGHT;
+const effectIndices = new Set();
+let worldRevision = 0;
 let nextBranchId = 1;
 let floweredBranches = new Set();
 let nextPlantFamilyId = 1;
@@ -140,6 +145,9 @@ const image = ctx.createImageData(WIDTH, HEIGHT);
 const CHUNK_SIZE = 10;
 const CHUNK_COLUMNS = Math.ceil(WIDTH / CHUNK_SIZE);
 const CHUNK_ROWS = Math.ceil(HEIGHT / CHUNK_SIZE);
+const CHUNK_MIN_X = Int16Array.from({ length: CHUNK_COLUMNS }, (_, x) => x * CHUNK_SIZE);
+const CHUNK_MAX_X = Int16Array.from({ length: CHUNK_COLUMNS }, (_, x) => Math.min(WIDTH, (x + 1) * CHUNK_SIZE));
+const CHUNK_ROW_BY_Y = Uint16Array.from({ length: HEIGHT }, (_, y) => Math.floor(y / CHUNK_SIZE) * CHUNK_COLUMNS);
 const activeChunks = new Uint8Array(CHUNK_COLUMNS * CHUNK_ROWS);
 const currentChunks = new Uint8Array(CHUNK_COLUMNS * CHUNK_ROWS);
 const nextActiveChunks = new Uint8Array(CHUNK_COLUMNS * CHUNK_ROWS);
@@ -192,6 +200,25 @@ function initialEnergy(kind) {
   return 0;
 }
 
+function isEffectKind(kind) {
+  return kind === FIRE || kind === ELECTRICITY || kind === SMOKE || kind === FLOWER ||
+    kind === PLANT || kind === FRUIT || kind === FALLEN_FRUIT;
+}
+
+function rebuildDerivedIndexes(allEmpty = false) {
+  materialCounts.fill(0);
+  effectIndices.clear();
+  if (allEmpty) {
+    materialCounts[EMPTY] = cells.length;
+    return;
+  }
+  for (let i = 0; i < cells.length; i++) {
+    const kind = cells[i];
+    materialCounts[kind]++;
+    if (isEffectKind(kind)) effectIndices.add(i);
+  }
+}
+
 function chunkIndex(x, y) {
   return Math.floor(y / CHUNK_SIZE) * CHUNK_COLUMNS + Math.floor(x / CHUNK_SIZE);
 }
@@ -224,7 +251,15 @@ function markAllDirty() {
 }
 
 function setCell(i, kind, nextEnergy = initialEnergy(kind), nextAge = 0, nextLean = 0, nextBranchBudget = 0, nextBranchId = 0) {
+  const previousKind = cells[i];
+  if (previousKind !== kind) {
+    materialCounts[previousKind]--;
+    materialCounts[kind]++;
+    if (isEffectKind(previousKind)) effectIndices.delete(i);
+    if (isEffectKind(kind)) effectIndices.add(i);
+  }
   cells[i] = kind;
+  worldRevision++;
   energy[i] = nextEnergy;
   if (kind === PLANT) {
     plantAge[i] = nextAge;
@@ -240,6 +275,50 @@ function setCell(i, kind, nextEnergy = initialEnergy(kind), nextAge = 0, nextLea
   }
   wakeCell(i);
   markDirty(i);
+}
+
+let physicsWorker = null;
+let physicsWorkerBusy = false;
+let physicsWorkerResult = null;
+let physicsWorkerRevision = 0;
+let physicsWorkerStartedAt = 0;
+let physicsWorkerMs = 0;
+
+if (typeof Worker !== 'undefined' && location.protocol !== 'file:') {
+  try {
+    physicsWorker = new Worker('physics-worker.js');
+    physicsWorker.addEventListener('message', ({ data }) => {
+      if (data.type !== 'step-result') return;
+      physicsWorkerResult = data;
+      physicsWorkerBusy = false;
+      physicsWorkerMs = performance.now() - physicsWorkerStartedAt;
+    });
+    physicsWorker.addEventListener('error', (error) => {
+      console.warn('物理Worker不可用，已回退到主线程。', error);
+      physicsWorker?.terminate();
+      physicsWorker = null;
+      physicsWorkerBusy = false;
+      physicsWorkerResult = null;
+    });
+  } catch (error) {
+    console.warn('物理Worker创建失败，已回退到主线程。', error);
+    physicsWorker = null;
+  }
+}
+
+function requestWorkerPhysicsStep() {
+  const snapshot = cells.slice();
+  physicsWorkerRevision = worldRevision;
+  physicsWorkerBusy = true;
+  physicsWorkerStartedAt = performance.now();
+  physicsWorker.postMessage({
+    type: 'step',
+    cells: snapshot.buffer,
+    width: WIDTH,
+    height: HEIGHT,
+    tick,
+    revision: physicsWorkerRevision,
+  }, [snapshot.buffer]);
 }
 
 function showMessage(text) {
@@ -304,6 +383,8 @@ function restoreSnapshot(snapshot) {
   };
   globalThis.sandboxAnimals?.restore(snapshot.animals);
   cells.set(snapshot.cells);
+  worldRevision++;
+  rebuildDerivedIndexes();
   energy.set(snapshot.energy);
   plantAge.set(snapshot.plantAge || new Uint16Array(cells.length));
   plantLean.set(snapshot.plantLean || new Int8Array(cells.length));
@@ -467,6 +548,7 @@ function resetWorld() {
   clearHarvestFeedback();
   harvestTotals = { picked: 0, fallen: 0 };
   cells.fill(EMPTY);
+  rebuildDerivedIndexes(true);
   energy.fill(0);
   plantAge.fill(0);
   plantLean.fill(0);
@@ -561,6 +643,7 @@ function clearWorld() {
   globalThis.sandboxAnimals?.clear();
   globalThis.sandboxTutorial?.worldChanged();
   cells.fill(EMPTY);
+  rebuildDerivedIndexes(true);
   energy.fill(0);
   plantAge.fill(0);
   plantLean.fill(0);
@@ -1679,6 +1762,7 @@ function updateSteam(x, y, i) {
 }
 
 function updatePlantWaterlogging() {
+  if (tick % WATERLOG_CHECK_INTERVAL !== 0) return;
   let changing = false;
   let atRisk = 0, deadCount = 0, newWarning = false;
   for (const family of plantFamilies.values()) {
@@ -1700,7 +1784,8 @@ function updatePlantWaterlogging() {
     const willow = family.treeKind === 'willow', mangrove = family.treeKind === 'mangrove';
     const flooded = water >= (mangrove ? 34 : willow ? 24 : 12) && wetRows >= (mangrove ? 6 : willow ? 5 : 4);
     const tolerance = mangrove ? 8 : willow ? 4 : family.species === 'cactus' ? 0.65 : family.species === 'mushroom' ? 1.5 : 1;
-    family.waterlogStress = Math.max(0, (family.waterlogStress || 0) + (flooded ? 1 : -3));
+    family.waterlogStress = Math.max(0, (family.waterlogStress || 0) +
+      (flooded ? WATERLOG_CHECK_INTERVAL : -3 * WATERLOG_CHECK_INTERVAL));
     if (flooded && family.waterlogStress >= WATERLOG_STRESS_TICKS * tolerance * 0.7) {
       atRisk++;
       if (!family.waterlogNotified) {
@@ -1712,9 +1797,9 @@ function updatePlantWaterlogging() {
     }
     const previousWilt = family.wilt || 0;
     if (family.waterlogStress >= WATERLOG_STRESS_TICKS * tolerance && flooded) {
-      family.wilt = Math.min(1, previousWilt + 1 / WATERLOG_WILT_TICKS);
+      family.wilt = Math.min(1, previousWilt + WATERLOG_CHECK_INTERVAL / WATERLOG_WILT_TICKS);
     } else if (!flooded) {
-      family.wilt = Math.max(0, previousWilt - 1 / (WATERLOG_WILT_TICKS * 1.5));
+      family.wilt = Math.max(0, previousWilt - WATERLOG_CHECK_INTERVAL / (WATERLOG_WILT_TICKS * 1.5));
     }
     if (previousWilt >= 0.45 && family.wilt < 0.45) {
       for (const [id, tip] of Object.entries(family.branchTips || {})) {
@@ -1753,60 +1838,110 @@ function updatePlantWaterlogging() {
   }
 }
 
-function update() {
-  moved.fill(0);
+function clearMovedInChunks(chunks) {
+  for (let chunk = 0; chunk < chunks.length; chunk++) {
+    if (!chunks[chunk]) continue;
+    const chunkX = chunk % CHUNK_COLUMNS;
+    const chunkY = Math.floor(chunk / CHUNK_COLUMNS);
+    const minX = CHUNK_MIN_X[chunkX];
+    const maxX = CHUNK_MAX_X[chunkX];
+    const minY = chunkY * CHUNK_SIZE;
+    const maxY = Math.min(HEIGHT, minY + CHUNK_SIZE);
+    for (let y = minY; y < maxY; y++) moved.fill(0, indexOf(minX, y), indexOf(maxX, y));
+  }
+}
+
+function updateMainStep(skipWorkerMaterials = false) {
   currentChunks.set(activeChunks);
+  clearMovedInChunks(currentChunks);
   nextActiveChunks.fill(0);
   updatePlantWaterlogging();
   // 重力材料从下往上扫描，避免同一个粒子在一帧内连续下落多格。
   for (let y = HEIGHT - 2; y >= 0; y--) {
-    const reverse = (y + tick) % 2 === 0;
-    const chunkRow = Math.floor(y / CHUNK_SIZE) * CHUNK_COLUMNS;
+    const reverse = ((y + tick) & 1) === 0;
+    const rowOffset = y * WIDTH;
+    const chunkRow = CHUNK_ROW_BY_Y[y];
     for (let chunkStep = 0; chunkStep < CHUNK_COLUMNS; chunkStep++) {
       const chunkX = reverse ? CHUNK_COLUMNS - 1 - chunkStep : chunkStep;
       if (!currentChunks[chunkRow + chunkX]) continue;
-      const minX = chunkX * CHUNK_SIZE;
-      const maxX = Math.min(WIDTH, minX + CHUNK_SIZE);
+      const minX = CHUNK_MIN_X[chunkX];
+      const maxX = CHUNK_MAX_X[chunkX];
       for (let localStep = 0; localStep < maxX - minX; localStep++) {
         const x = reverse ? maxX - 1 - localStep : minX + localStep;
-        const i = indexOf(x, y);
+        const i = rowOffset + x;
         if (moved[i]) continue;
-        if (cells[i] === SAND || cells[i] === WATER) updatePowderOrLiquid(x, y, cells[i]);
-        else if (cells[i] === SALT) updateSalt(x, y, i);
-        else if (isSeedKind(cells[i])) updateSeed(x, y, i);
-        else if (cells[i] === ACID) updateAcid(x, y, i);
-        else if (cells[i] === WOOD) updateWood(x, y, i);
-        else if (cells[i] === PLANT) updatePlant(x, y, i);
-        else if (cells[i] === FLOWER) updateFlower(x, y, i);
-        else if (cells[i] === FRUIT) updateFruit(x, y, i);
-        else if (cells[i] === FALLEN_FRUIT) updateFallenFruit(x, y, i);
-        else if (cells[i] === METAL) updateMetal(x, y, i);
-        else if (cells[i] === ELECTRICITY) updateElectricity(x, y, i);
+        const kind = cells[i];
+        switch (kind) {
+          case SAND:
+          case WATER:
+            if (!skipWorkerMaterials) updatePowderOrLiquid(x, y, kind);
+            break;
+          case SALT: updateSalt(x, y, i); break;
+          case SEED:
+          case TREE_SEED:
+          case GIANT_SEED:
+          case MUSHROOM_SEED:
+          case CACTUS_SEED:
+          case WILLOW_SEED:
+          case MANGROVE_SEED: updateSeed(x, y, i); break;
+          case ACID: updateAcid(x, y, i); break;
+          case WOOD: updateWood(x, y, i); break;
+          case PLANT: updatePlant(x, y, i); break;
+          case FLOWER: updateFlower(x, y, i); break;
+          case FRUIT: updateFruit(x, y, i); break;
+          case FALLEN_FRUIT: updateFallenFruit(x, y, i); break;
+          case METAL: updateMetal(x, y, i); break;
+          case ELECTRICITY: updateElectricity(x, y, i); break;
+        }
       }
     }
   }
   // 上升材料采用相反扫描方向。
   for (let y = 1; y < HEIGHT; y++) {
-    const reverse = (y + tick) % 2 !== 0;
-    const chunkRow = Math.floor(y / CHUNK_SIZE) * CHUNK_COLUMNS;
+    const reverse = ((y + tick) & 1) !== 0;
+    const rowOffset = y * WIDTH;
+    const chunkRow = CHUNK_ROW_BY_Y[y];
     for (let chunkStep = 0; chunkStep < CHUNK_COLUMNS; chunkStep++) {
       const chunkX = reverse ? CHUNK_COLUMNS - 1 - chunkStep : chunkStep;
       if (!currentChunks[chunkRow + chunkX]) continue;
-      const minX = chunkX * CHUNK_SIZE;
-      const maxX = Math.min(WIDTH, minX + CHUNK_SIZE);
+      const minX = CHUNK_MIN_X[chunkX];
+      const maxX = CHUNK_MAX_X[chunkX];
       for (let localStep = 0; localStep < maxX - minX; localStep++) {
         const x = reverse ? maxX - 1 - localStep : minX + localStep;
-        const i = indexOf(x, y);
+        const i = rowOffset + x;
         if (moved[i]) continue;
-        if (cells[i] === FIRE) updateFire(x, y, i);
-        else if (cells[i] === SMOKE) updateSmoke(x, y, i);
-        else if (cells[i] === STEAM) updateSteam(x, y, i);
+        switch (cells[i]) {
+          case FIRE: updateFire(x, y, i); break;
+          case SMOKE: updateSmoke(x, y, i); break;
+          case STEAM: updateSteam(x, y, i); break;
+        }
       }
     }
   }
   globalThis.sandboxAnimals?.update();
   activeChunks.set(nextActiveChunks);
   tick++;
+}
+
+function update() {
+  if (!physicsWorker) {
+    updateMainStep(false);
+    return;
+  }
+  if (physicsWorkerResult) {
+    const result = physicsWorkerResult;
+    physicsWorkerResult = null;
+    // 用户在Worker计算期间绘制或重置过世界时，丢弃旧结果，避免覆盖新操作。
+    if (result.revision !== worldRevision) return;
+    for (let at = 0; at < result.indices.length; at++) {
+      const i = result.indices[at];
+      const kind = result.kinds[at];
+      if (cells[i] !== kind) setCell(i, kind);
+    }
+    updateMainStep(true);
+    return;
+  }
+  if (!physicsWorkerBusy) requestWorkerPhysicsStep();
 }
 
 function colorFor(i, kind) {
@@ -1896,10 +2031,8 @@ function render(now = globalThis.performance?.now?.() ?? 0) {
   // 状态栏不需要跟随 60 FPS 重算。降低全世界扫描和 DOM 更新频率，
   // 但首次渲染、暂停后的手动修改仍会立即更新。
   if (now - lastStatsRenderTime >= 400) {
-    const counts = new Uint32Array(MATERIALS.length);
-    for (let i = 0; i < cells.length; i++) counts[cells[i]]++;
-    const seedCount = MATERIALS.reduce((total, material) => total + (isSeedKind(material.id) ? counts[material.id] : 0), 0);
-    statsLabel.textContent = `水：${counts[WATER]} · 种子：${seedCount} · 根茎：${counts[PLANT]} · 树叶：${counts[LEAF]} · 果实：${counts[FRUIT] + counts[FALLEN_FRUIT]} · 花/菌盖：${counts[FLOWER]} · 火：${counts[FIRE]} · 酸：${counts[ACID]} · 盐：${counts[SALT]} · 电：${counts[ELECTRICITY]} · 第 ${tick} 帧`;
+    const seedCount = MATERIALS.reduce((total, material) => total + (isSeedKind(material.id) ? materialCounts[material.id] : 0), 0);
+    statsLabel.textContent = `水：${materialCounts[WATER]} · 种子：${seedCount} · 根茎：${materialCounts[PLANT]} · 树叶：${materialCounts[LEAF]} · 果实：${materialCounts[FRUIT] + materialCounts[FALLEN_FRUIT]} · 花/菌盖：${materialCounts[FLOWER]} · 火：${materialCounts[FIRE]} · 酸：${materialCounts[ACID]} · 盐：${materialCounts[SALT]} · 电：${materialCounts[ELECTRICITY]} · 第 ${tick} 帧`;
     harvestStatsLabel.textContent = `🧺 已收集：${harvestTotals.picked + harvestTotals.fallen} · 树上采摘：${harvestTotals.picked} · 落果拾取：${harvestTotals.fallen}`;
     globalThis.sandboxAnimals?.renderStatus();
     lastStatsRenderTime = now;
@@ -2102,7 +2235,7 @@ function renderEffects() {
   let currentFilter = 'none';
   gpuEffectCount = 0;
 
-  for (let i = 0; i < cells.length; i++) {
+  for (const i of effectIndices) {
     const kind = cells[i];
     if (kind !== FIRE && kind !== ELECTRICITY && kind !== SMOKE && kind !== FLOWER &&
         kind !== PLANT && kind !== FRUIT && kind !== FALLEN_FRUIT) continue;
@@ -2606,7 +2739,8 @@ function loop(now) {
   if (!metricsWindowStart) metricsWindowStart = now;
   if (now - metricsWindowStart >= 500) {
     const fps = (metricsFrameCount * 1000) / (now - metricsWindowStart);
-    performanceLabel.textContent = `FPS：${fps.toFixed(0)} · 更新：${averageUpdateMs.toFixed(2)} ms · 活动区：${activeChunkCount()}/${activeChunks.length}`;
+    const workerStatus = physicsWorker ? ` · Worker：${physicsWorkerMs.toFixed(2)} ms` : ' · Worker：回退主线程';
+    performanceLabel.textContent = `FPS：${fps.toFixed(0)} · 更新：${averageUpdateMs.toFixed(2)} ms · 活动区：${activeChunkCount()}/${activeChunks.length}${workerStatus}`;
     metricsWindowStart = now;
     metricsFrameCount = 0;
   }
